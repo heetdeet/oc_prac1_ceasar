@@ -1,0 +1,32 @@
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+x64/
+Debug/
+Release/
+*.pdb
+*.idb
+*.ipdb
+*.iobj
+*.aps
+*.ncb
+*.sdf
+*.cachefile
+
+# Компиляция
+*.o
+*.so
+*.dll
+*.lib
+*.exe
+*.out
+*.app
+
+# Тестовые файлы (можно загрузить пустые шаблоны, но результат не нужен)
+input.txt
+output.txt
+decrypted.txt
+check.txt
