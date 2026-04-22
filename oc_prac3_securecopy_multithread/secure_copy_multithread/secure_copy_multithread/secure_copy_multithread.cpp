@@ -3,6 +3,7 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <string>
 #include <queue>
@@ -14,25 +15,42 @@
 namespace fs = std::filesystem;
 using namespace std::chrono;
 
-
+// константы
 const int TIMEOUT_SECONDS = 5;
 const int MAX_RETRIES = 3;
+const int WORKERS_COUNT = 4;
 
+// типы указателей на функции из библиотеки
 typedef void (*set_key_func)(char);
 typedef void (*caesar_func)(void*, void*, int);
 
-set_key_func set_key = nullptr;
-caesar_func caesar = nullptr;
+// структура для хранения статистики по файлу
+struct FileStats {
+    std::string filename;
+    milliseconds duration;
+    bool success;
+    std::string error_msg;
+};
 
-std::timed_mutex file_mutex;      // для счетчика и очереди файлов
-std::mutex log_mutex;             // отдельный мьютекс для логирования
+// режимы работы
+enum Mode {
+    MODE_SEQUENTIAL,
+    MODE_PARALLEL,
+    MODE_AUTO
+};
 
-int files_copied = 0;
-std::queue<std::string> file_queue;
-bool all_files_queued = false;
-bool system_error = false;         // Флаг системной ошибки
+// структура для контекста параллельной работы
+struct ParallelContext {
+    std::queue<std::string> file_queue;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<FileStats> results;
+    std::mutex results_mtx;
+    bool all_done = false;
+    bool system_error = false;
+};
 
-// Вспомогательная функция для получения текущего времени
+// вспомогательная функция для получения текущего времени
 std::string get_current_time() {
     auto now = system_clock::now();
     auto now_time_t = system_clock::to_time_t(now);
@@ -45,18 +63,15 @@ std::string get_current_time() {
 
 // логирование
 void log_operation(const std::string& filename, const std::string& status,
-    const std::chrono::milliseconds& duration) {
+    const milliseconds& duration, std::mutex& log_mutex) {
     std::lock_guard<std::mutex> lock(log_mutex);
-
     std::ofstream logfile("log.txt", std::ios::app);
     if (!logfile) return;
 
-    // ID потока
     std::stringstream ss;
     ss << std::this_thread::get_id();
     std::string thread_id = ss.str();
 
-    // запись в лог
     logfile << "[" << get_current_time() << "] "
         << "Поток " << thread_id << " | "
         << "Файл: " << filename << " | "
@@ -64,65 +79,21 @@ void log_operation(const std::string& filename, const std::string& status,
         << "Время: " << duration.count() << "мс" << std::endl;
 }
 
-// ф-ция для безопасного обновления счетчика с таймаутом и повторными попытками
-bool update_counter_with_timeout(const std::string& filename) {
-    int retry_count = 0;
-
-    while (retry_count < MAX_RETRIES) {
-        auto deadline = steady_clock::now() + seconds(TIMEOUT_SECONDS);
-
-        if (file_mutex.try_lock_until(deadline)) {
-            // успехом захватили мьютекс
-            files_copied++;
-            std::cout << "Прогресс: скопировано " << files_copied << " файлов" << std::endl;
-            file_mutex.unlock();
-            return true;
-        }
-        else {
-            retry_count++;
-            std::cerr << "ПРЕДУПРЕЖДЕНИЕ: Возможная взаимоблокировка - поток "
-                << std::this_thread::get_id()
-                << " ожидает мьютекс более " << TIMEOUT_SECONDS
-                << " секунд (попытка " << retry_count
-                << " из " << MAX_RETRIES << ")" << std::endl;
-
-            // лог предупреждение
-            {
-                std::lock_guard<std::mutex> lock(log_mutex);
-                std::ofstream logfile("log.txt", std::ios::app);
-                logfile << "[" << get_current_time() << "] "
-                    << "ПРЕДУПРЕЖДЕНИЕ: Поток " << std::this_thread::get_id()
-                    << " не может захватить мьютекс (попытка " << retry_count << ")\n";
-            }
-        }
-    }
-
-    // превышено количество попыток
-    std::cerr << "КРИТИЧЕСКАЯ ОШИБКА: Поток " << std::this_thread::get_id()
-        << " не может обновить счетчик после " << MAX_RETRIES
-        << " попыток. Аварийное завершение потока!" << std::endl;
-
-    // лог критической ошибку
-    {
-        std::lock_guard<std::mutex> lock(log_mutex);
-        std::ofstream logfile("log.txt", std::ios::app);
-        logfile << "[" << get_current_time() << "] "
-            << "КРИТИЧЕСКАЯ ОШИБКА: Поток " << std::this_thread::get_id()
-            << " аварийно завершен из-за невозможности захватить мьютекс\n";
-    }
-
-    return false;
-}
-
-// ф-ция обработки одного файла
-void process_file(const std::string& input_file, const std::string& output_dir, char key) {
+// обработка одного файла (возвращает статистику)
+FileStats process_single_file(const std::string& input_file,
+    const std::string& output_dir,
+    char key,
+    set_key_func set_key,
+    caesar_func caesar,
+    std::mutex& log_mutex) {
     auto start_time = high_resolution_clock::now();
-    std::string status = "ОШИБКА";
+    FileStats stats;
+    stats.filename = input_file;
+    stats.success = false;
 
     try {
         std::string output_file = (fs::path(output_dir) / fs::path(input_file).filename()).string();
 
-        // открываем входной файл
         std::ifstream in(input_file, std::ios::binary | std::ios::ate);
         if (!in) {
             throw std::runtime_error("Не удалось открыть входной файл");
@@ -137,274 +108,397 @@ void process_file(const std::string& input_file, const std::string& output_dir, 
         }
         in.close();
 
-
-        if (input_file.find("slow.txt") != std::string::npos) {
-            std::cout << "Обнаружен медленный файл, имитация долгой обработки..." << std::endl;
-            std::this_thread::sleep_for(std::chrono::seconds(10));
-        }
-
         set_key(key);
         caesar(buffer.data(), buffer.data(), static_cast<int>(size));
 
-        // запись результата
         std::ofstream out(output_file, std::ios::binary);
         if (!out.write(buffer.data(), size)) {
             throw std::runtime_error("Ошибка записи выходного файла");
         }
 
-        status = "УСПЕХ";
-
-        // обновляем счетчик с защитой от зависания
-        if (!update_counter_with_timeout(input_file)) {
-            status = "ОШИБКА: Невозможно обновить счетчик (системная ошибка)";
-            system_error = true;
-        }
-
+        stats.success = true;
     }
     catch (const std::exception& e) {
+        stats.error_msg = e.what();
         std::cerr << "Ошибка обработки файла " << input_file << ": " << e.what() << std::endl;
-        status = std::string("ОШИБКА: ") + e.what();
     }
 
     auto end_time = high_resolution_clock::now();
-    auto duration = duration_cast<milliseconds>(end_time - start_time);
+    stats.duration = duration_cast<milliseconds>(end_time - start_time);
 
-    log_operation(input_file, status, duration);
+    log_operation(input_file, stats.success ? "УСПЕХ" : ("ОШИБКА: " + stats.error_msg),
+        stats.duration, log_mutex);
+
+    return stats;
 }
 
-// ф-ция для безопасного получения файла из очереди
-bool get_file_from_queue(std::string& filename, int thread_id) {
-    int retry_count = 0;
+// последовательная обработка
+std::vector<FileStats> run_sequential(const std::vector<std::string>& input_files,
+    const std::string& output_dir,
+    char key,
+    set_key_func set_key,
+    caesar_func caesar,
+    std::mutex& log_mutex) {
+    std::cout << "\n=== ПОСЛЕДОВАТЕЛЬНЫЙ РЕЖИМ ===" << std::endl;
+    std::vector<FileStats> results;
 
-    while (retry_count < MAX_RETRIES && !system_error) {
-        auto deadline = steady_clock::now() + seconds(TIMEOUT_SECONDS);
+    for (size_t i = 0; i < input_files.size(); i++) {
+        std::cout << "Обработка файла " << (i + 1) << "/" << input_files.size()
+            << ": " << input_files[i] << std::endl;
 
-        if (file_mutex.try_lock_until(deadline)) {
-            if (!file_queue.empty()) {
-                filename = file_queue.front();
-                file_queue.pop();
-                file_mutex.unlock();
-                return true;
+        FileStats stats = process_single_file(input_files[i], output_dir, key,
+            set_key, caesar, log_mutex);
+        results.push_back(stats);
+
+        std::cout << "  Время: " << stats.duration.count() << " мс"
+            << (stats.success ? " [OK]" : " [FAIL]") << std::endl;
+    }
+
+    return results;
+}
+
+// рабочий поток для параллельного режима
+void worker_thread(ParallelContext& ctx, const std::string& output_dir, char key,
+    set_key_func set_key, caesar_func caesar, std::mutex& log_mutex,
+    int thread_num) {
+    std::cout << "Поток " << thread_num << " (ID: " << std::this_thread::get_id() << ") запущен" << std::endl;
+
+    while (true) {
+        std::string filename;
+
+        {
+            std::unique_lock<std::mutex> lock(ctx.mtx);
+            ctx.cv.wait(lock, [&ctx] { return !ctx.file_queue.empty() || ctx.all_done; });
+
+            if (ctx.all_done && ctx.file_queue.empty()) {
+                break;
             }
-            else if (all_files_queued) {
-                file_mutex.unlock();
-                return false;  // нет больше файлов
+
+            if (!ctx.file_queue.empty()) {
+                filename = ctx.file_queue.front();
+                ctx.file_queue.pop();
             }
             else {
-                file_mutex.unlock();
-                std::this_thread::sleep_for(milliseconds(100));
                 continue;
             }
         }
-        else {
-            retry_count++;
-            std::cerr << "ПРЕДУПРЕЖДЕНИЕ: Поток " << thread_id
-                << " не может получить доступ к очереди (попытка "
-                << retry_count << " из " << MAX_RETRIES << ")" << std::endl;
 
-            {
-                std::lock_guard<std::mutex> lock(log_mutex);
-                std::ofstream logfile("log.txt", std::ios::app);
-                logfile << "[" << get_current_time() << "] "
-                    << "ПРЕДУПРЕЖДЕНИЕ: Поток " << std::this_thread::get_id()
-                    << " не может получить доступ к очереди (попытка "
-                    << retry_count << ")\n";
-            }
-        }
-    }
-
-    if (retry_count >= MAX_RETRIES) {
-        std::cerr << "КРИТИЧЕСКАЯ ОШИБКА: Поток " << thread_id
-            << " не может получить доступ к очереди после " << MAX_RETRIES
-            << " попыток. Аварийное завершение потока!" << std::endl;
+        std::cout << "Поток " << thread_num << " обрабатывает: " << filename << std::endl;
+        FileStats stats = process_single_file(filename, output_dir, key,
+            set_key, caesar, log_mutex);
 
         {
-            std::lock_guard<std::mutex> lock(log_mutex);
-            std::ofstream logfile("log.txt", std::ios::app);
-            logfile << "[" << get_current_time() << "] "
-                << "КРИТИЧЕСКАЯ ОШИБКА: Поток " << std::this_thread::get_id()
-                << " аварийно завершен из-за невозможности получить доступ к очереди\n";
+            std::lock_guard<std::mutex> lock(ctx.results_mtx);
+            ctx.results.push_back(stats);
+            if (!stats.success) {
+                ctx.system_error = true;
+            }
         }
-    }
-
-    return false;
-}
-
-// фция рабочего потока
-void worker_thread(const std::string& output_dir, char key, int thread_num) {
-    std::cout << "Поток " << thread_num << " (ID: " << std::this_thread::get_id() << ") запущен" << std::endl;
-
-    while (!system_error) {
-        std::string filename;
-
-        // пытемся получить файл из очереди
-        if (!get_file_from_queue(filename, thread_num)) {
-            break;  // завершение потока (нет файлов или ошибка)
-        }
-
-        std::cout << "Поток " << thread_num << " обрабатывает файл: " << filename << std::endl;
-        process_file(filename, output_dir, key);
     }
 
     std::cout << "Поток " << thread_num << " завершен" << std::endl;
 }
 
+// параллельная обработка
+
+std::vector<FileStats> run_parallel(const std::vector<std::string>& input_files,
+    const std::string& output_dir,
+    char key,
+    set_key_func set_key,
+    caesar_func caesar,
+    std::mutex& log_mutex) {
+    std::cout << "\n=== ПАРАЛЛЕЛЬНЫЙ РЕЖИМ ===" << std::endl;
+    std::cout << "Количество потоков: " << WORKERS_COUNT << std::endl;
+
+    std::queue<std::string> file_queue;
+    std::mutex queue_mutex;
+    std::vector<FileStats> results;
+    std::mutex results_mutex;
+    bool all_done = false;
+
+    // заполняем очередь
+    for (const auto& file : input_files) {
+        file_queue.push(file);
+    }
+
+    std::vector<std::thread> threads;
+
+    // создаём потоки
+    for (int i = 0; i < WORKERS_COUNT; i++) {
+        threads.emplace_back([&, i]() {
+            std::cout << "Поток " << (i + 1) << " (ID: " << std::this_thread::get_id() << ") запущен" << std::endl;
+
+            while (true) {
+                std::string filename;
+
+                // захватываем файл из очереди
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    if (file_queue.empty()) {
+                        break;
+                    }
+                    filename = file_queue.front();
+                    file_queue.pop();
+                }
+
+                std::cout << "Поток " << (i + 1) << " обрабатывает: " << filename << std::endl;
+                FileStats stats = process_single_file(filename, output_dir, key,
+                    set_key, caesar, log_mutex);
+
+                {
+                    std::lock_guard<std::mutex> lock(results_mutex);
+                    results.push_back(stats);
+                }
+            }
+
+            std::cout << "Поток " << (i + 1) << " завершен" << std::endl;
+        });
+    }
+
+    // ждём завершения всех потоков
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    return results;
+}
+
+// фвтоматический выбор режима
+Mode auto_select_mode(int file_count) {
+    if (file_count < 5) {
+        std::cout << "Автовыбор: файлов < 5 -> ПОСЛЕДОВАТЕЛЬНЫЙ режим" << std::endl;
+        return MODE_SEQUENTIAL;
+    }
+    else {
+        std::cout << "Автовыбор: файлов >= 5 -> ПАРАЛЛЕЛЬНЫЙ режим" << std::endl;
+        return MODE_PARALLEL;
+    }
+}
+
+// парсинг аргумента --mode
+Mode parse_mode_arg(int argc, char* argv[]) {
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--mode=sequential") return MODE_SEQUENTIAL;
+        if (arg == "--mode=parallel") return MODE_PARALLEL;
+        if (arg == "--mode=auto") return MODE_AUTO;
+    }
+    return MODE_AUTO;
+}
+
+// запуск обработки в заданном режиме и возврат времени
+milliseconds run_mode(Mode mode, const std::vector<std::string>& files,
+    const std::string& output_dir, char key,
+    set_key_func set_key, caesar_func caesar,
+    std::mutex& log_mutex,
+    std::vector<FileStats>& out_results) {
+    auto start = high_resolution_clock::now();
+
+    if (mode == MODE_SEQUENTIAL) {
+        out_results = run_sequential(files, output_dir, key, set_key, caesar, log_mutex);
+    }
+    else {
+        out_results = run_parallel(files, output_dir, key, set_key, caesar, log_mutex);
+    }
+
+    auto end = high_resolution_clock::now();
+    return duration_cast<milliseconds>(end - start);
+}
+
 int main(int argc, char* argv[]) {
     setlocale(LC_ALL, "rus");
-    if (argc < 4) {
+
+    // парсинг режима
+    Mode mode = parse_mode_arg(argc, argv);
+    int start_idx = 1;
+
+    if (argc >= 2 && std::string(argv[1]).find("--mode=") == 0) {
+        start_idx = 2;
+    }
+
+    // проверка аргументов
+    if (argc - start_idx < 4) {
         std::cerr << "Использование: " << argv[0]
-            << " <путь_к_библиотеке> <файл1> <файл2> ... <выходная_директория> <ключ>" << std::endl;
-        std::cerr << "Пример: " << argv[0]
-            << " libcaesar.dll file1.txt file2.txt file3.txt output_dir/ K" << std::endl;
+            << " [--mode=sequential|parallel|auto] <путь_к_библиотеке> <файл1> <файл2> ... <выходная_директория> <ключ>"
+            << std::endl;
         return 1;
     }
 
     // парсинг аргументов
-    std::string lib_path = argv[1];
-
+    std::string lib_path = argv[start_idx++];
     std::vector<std::string> input_files;
-    for (int i = 2; i < argc - 2; i++) {
+    for (int i = start_idx; i < argc - 2; i++) {
         input_files.push_back(argv[i]);
     }
-
     std::string output_dir = argv[argc - 2];
-
-    // убираем возможный слеш в конце для единообразия
     if (!output_dir.empty() && output_dir.back() == '/') {
         output_dir.pop_back();
     }
-
     char key = argv[argc - 1][0];
 
+    // автовыбор
+    Mode original_mode = mode;
+    if (mode == MODE_AUTO) {
+        mode = auto_select_mode(static_cast<int>(input_files.size()));
+    }
+
+    // вывод информации
     std::cout << "=========================================" << std::endl;
-    std::cout << "ЗАПУСК ПРОГРАММЫ SECURE COPY (МНОГОПОТОЧНАЯ)" << std::endl;
+    std::cout << "ЗАПУСК ПРОГРАММЫ SECURE COPY" << std::endl;
     std::cout << "=========================================" << std::endl;
+    std::cout << "Режим: " << (mode == MODE_SEQUENTIAL ? "ПОСЛЕДОВАТЕЛЬНЫЙ" : "ПАРАЛЛЕЛЬНЫЙ") << std::endl;
     std::cout << "Путь к библиотеке: " << lib_path << std::endl;
     std::cout << "Входных файлов: " << input_files.size() << std::endl;
     std::cout << "Выходная директория: " << output_dir << std::endl;
     std::cout << "Ключ: " << key << std::endl;
-    std::cout << "Таймаут мьютекса: " << TIMEOUT_SECONDS << " сек" << std::endl;
-    std::cout << "Макс. попыток: " << MAX_RETRIES << std::endl;
     std::cout << "=========================================" << std::endl;
 
-    // 1. ДИНАМИЧЕСКИ ЗАГРУЖАЕМ БИБЛИОТЕКУ
+    // загрузка библиотеки
     std::cout << "Загрузка библиотеки: " << lib_path << std::endl;
-
     HINSTANCE hLib = LoadLibraryA(lib_path.c_str());
     if (!hLib) {
         std::cerr << "Не удалось загрузить библиотеку. Код ошибки: " << GetLastError() << std::endl;
         return 1;
     }
 
-    set_key = (set_key_func)GetProcAddress(hLib, "set_key");
-    caesar = (caesar_func)GetProcAddress(hLib, "caesar");
+    set_key_func set_key = (set_key_func)GetProcAddress(hLib, "set_key");
+    caesar_func caesar = (caesar_func)GetProcAddress(hLib, "caesar");
 
     if (!set_key || !caesar) {
-        std::cerr << "Не удалось получить адреса функций. Код ошибки: " << GetLastError() << std::endl;
+        std::cerr << "Не удалось получить адреса функций" << std::endl;
         FreeLibrary(hLib);
         return 1;
     }
+    std::cout << "Библиотека успешно загружена" << std::endl;
 
-    std::cout << "Библиотека успешно загружена. Функции найдены." << std::endl;
-
-    // 2. СОЗДАЕМ ВЫХОДНУЮ ДИРЕКТОРИЮ
+    // создание выходной директории
     try {
         fs::create_directories(output_dir);
         std::cout << "Выходная директория создана: " << output_dir << std::endl;
     }
     catch (const std::exception& e) {
-        std::cerr << "Ошибка создания выходной директории: " << e.what() << std::endl;
+        std::cerr << "Ошибка: " << e.what() << std::endl;
         FreeLibrary(hLib);
         return 1;
     }
 
-    // 3. ОЧИЩАЕМ/СОЗДАЕМ ЛОГ-ФАЙЛ
-    std::ofstream logfile("log.txt", std::ios::trunc);
-    logfile << "=== ЖУРНАЛ SECURE COPY (МНОГОПОТОЧНЫЙ) ===\n";
-    logfile << "Запуск: " << get_current_time() << "\n";
-    logfile << "Библиотека: " << lib_path << "\n";
-    logfile << "Выходная директория: " << output_dir << "\n";
-    logfile << "Ключ: " << key << "\n";
-    logfile << "Таймаут: " << TIMEOUT_SECONDS << " сек\n";
-    logfile << "Попыток: " << MAX_RETRIES << "\n";
-    logfile << "==========================================\n\n";
-    logfile.close();
-
-    // 4. ЗАПОЛНЯЕМ ОЧЕРЕДЬ ФАЙЛОВ
-    int files_queued = 0;
+    // лог-файл
+    std::mutex log_mutex;
     {
-        std::lock_guard<std::timed_mutex> lock(file_mutex);
-        for (const auto& file : input_files) {
-            if (fs::exists(file)) {
-                file_queue.push(file);
-                std::cout << "Добавлен в очередь: " << file << std::endl;
-                files_queued++;
-            }
-            else {
-                std::cerr << "Предупреждение: Файл не существует, пропуск: " << file << std::endl;
-                // лог пропущенный файл
-                std::lock_guard<std::mutex> log_lock(log_mutex);
-                std::ofstream logfile("log.txt", std::ios::app);
-                logfile << "[" << get_current_time() << "] Файл не существует, пропущен: " << file << "\n";
-            }
-        }
-        all_files_queued = true;
-        std::cout << "Всего файлов в очереди: " << file_queue.size() << std::endl;
+        std::ofstream logfile("log.txt", std::ios::trunc);
+        logfile << "=== ЖУРНАЛ SECURE COPY ===\n";
+        logfile << "Запуск: " << get_current_time() << "\n";
+        logfile << "==========================================\n\n";
+        logfile.close();
     }
 
-    if (files_queued == 0) {
+    // проверка существования файлов
+    std::vector<std::string> valid_files;
+    for (const auto& file : input_files) {
+        if (fs::exists(file)) {
+            valid_files.push_back(file);
+            std::cout << "Добавлен в очередь: " << file << std::endl;
+        }
+        else {
+            std::cerr << "Предупреждение: Файл не существует, пропуск: " << file << std::endl;
+        }
+    }
+
+    if (valid_files.empty()) {
         std::cerr << "Ошибка: нет файлов для обработки!" << std::endl;
         FreeLibrary(hLib);
         return 1;
     }
 
-    // 5. СОЗДАЕМ 3 РАБОЧИХ ПОТОКА
-    const int num_threads = 3;
-    std::vector<std::thread> threads;
+    // запуск выбранного режима
+    std::vector<FileStats> results;
+    milliseconds selected_duration = run_mode(mode, valid_files, output_dir, key,
+        set_key, caesar, log_mutex, results);
 
-    std::cout << "\nЗапуск " << num_threads << " потоков..." << std::endl;
-
-    auto program_start = high_resolution_clock::now();
-
-    for (int i = 0; i < num_threads; i++) {
-        threads.emplace_back(worker_thread, output_dir, key, i + 1);
-        std::this_thread::sleep_for(milliseconds(10)); // Небольшая задержка для красивого вывода
+    // подсчёт статистики
+    int success_count = 0;
+    long long total_file_time_ms = 0;
+    for (const auto& stat : results) {
+        if (stat.success) success_count++;
+        total_file_time_ms += stat.duration.count();
     }
+    double avg_time = results.empty() ? 0 : static_cast<double>(total_file_time_ms) / results.size();
 
-    // 6. ЖДЕМ ЗАВЕРШЕНИЯ ВСЕХ ПОТОКОВ
-    for (auto& t : threads) {
-        t.join();
-    }
-
-    auto program_end = high_resolution_clock::now();
-    auto total_duration = duration_cast<milliseconds>(program_end - program_start);
-
+    // вывод итогов
     std::cout << "\n=========================================" << std::endl;
-    if (system_error) {
-        std::cout << "ПРОГРАММА ЗАВЕРШЕНА С ОШИБКАМИ!" << std::endl;
-    }
-    else {
-        std::cout << "ВСЕ ФАЙЛЫ УСПЕШНО ОБРАБОТАНЫ!" << std::endl;
-    }
-    std::cout << "Скопировано файлов: " << files_copied << " из " << files_queued << std::endl;
-    std::cout << "Общее время: " << total_duration.count() << " мс" << std::endl;
-    std::cout << "Подробности в файле: " << fs::absolute("log.txt").string() << std::endl;
+    std::cout << "ВСЕ ФАЙЛЫ УСПЕШНО ОБРАБОТАНЫ!" << std::endl;
+    std::cout << "Скопировано файлов: " << success_count << " из " << valid_files.size() << std::endl;
+    std::cout << "Общее время: " << selected_duration.count() << " мс" << std::endl;
+    std::cout << "Среднее время на файл: " << std::fixed << std::setprecision(2) << avg_time << " мс" << std::endl;
     std::cout << "=========================================" << std::endl;
+
+    // СРАВНИТЕЛЬНАЯ ТАБЛИЦА (только в авто-режиме)
+    if (original_mode == MODE_AUTO && valid_files.size() >= 2) {
+        std::cout << "\n=== СРАВНИТЕЛЬНАЯ ТАБЛИЦА ===" << std::endl;
+
+        Mode alternative = (mode == MODE_SEQUENTIAL) ? MODE_PARALLEL : MODE_SEQUENTIAL;
+        std::cout << "Запуск альтернативного режима ("
+            << (alternative == MODE_SEQUENTIAL ? "ПОСЛЕДОВАТЕЛЬНЫЙ" : "ПАРАЛЛЕЛЬНЫЙ")
+            << ") для сравнения..." << std::endl;
+
+        // создаём новую директорию для альтернативного режима
+        std::string alt_output_dir = output_dir + "_alt";
+        fs::create_directories(alt_output_dir);
+
+        std::vector<FileStats> alt_results;
+        milliseconds alt_duration = run_mode(alternative, valid_files, alt_output_dir, key,
+            set_key, caesar, log_mutex, alt_results);
+
+        // подсчёт статистики альтернативного режима
+        int alt_success = 0;
+        for (const auto& stat : alt_results) {
+            if (stat.success) alt_success++;
+        }
+
+        std::cout << "\n--- СРАВНЕНИЕ ---" << std::endl;
+        std::cout << std::left << std::setw(25) << "Показатель"
+            << std::setw(20) << (mode == MODE_SEQUENTIAL ? "SEQUENTIAL" : "PARALLEL")
+            << std::setw(20) << (alternative == MODE_SEQUENTIAL ? "SEQUENTIAL" : "PARALLEL") << std::endl;
+        std::cout << std::string(60, '-') << std::endl;
+        std::cout << std::left << std::setw(25) << "Общее время (мс)"
+            << std::setw(20) << selected_duration.count()
+            << std::setw(20) << alt_duration.count() << std::endl;
+        std::cout << std::left << std::setw(25) << "Обработано файлов"
+            << std::setw(20) << success_count
+            << std::setw(20) << alt_success << std::endl;
+
+        // ускорение
+        double speedup = static_cast<double>(alt_duration.count()) / selected_duration.count();
+        std::cout << std::string(60, '-') << std::endl;
+        if (speedup > 1.0) {
+            std::cout << "Выбранный режим БЫСТРЕЕ в " << std::fixed << std::setprecision(2)
+                << speedup << " раз" << std::endl;
+        }
+        else if (speedup < 1.0) {
+            std::cout << "Выбранный режим МЕДЛЕННЕЕ в " << std::fixed << std::setprecision(2)
+                << (1.0 / speedup) << " раз" << std::endl;
+        }
+        else {
+            std::cout << "Режимы работают одинаково" << std::endl;
+        }
+        std::cout << "=========================================" << std::endl;
+
+        // очистка временной директории
+        //fs::remove_all(alt_output_dir);
+    }
 
     // итоговая запись в лог
     {
-        std::lock_guard<std::mutex> log_lock(log_mutex);
+        std::lock_guard<std::mutex> lock(log_mutex);
         std::ofstream logfile("log.txt", std::ios::app);
         logfile << "\n==========================================\n";
         logfile << "Завершение: " << get_current_time() << "\n";
-        logfile << "Скопировано файлов: " << files_copied << " из " << files_queued << "\n";
-        logfile << "Общее время: " << total_duration.count() << " мс\n";
-        logfile << "Статус: " << (system_error ? "С ОШИБКАМИ" : "УСПЕШНО") << "\n";
+        logfile << "Скопировано файлов: " << success_count << " из " << valid_files.size() << "\n";
+        logfile << "Общее время: " << selected_duration.count() << " мс\n";
+        logfile << "Среднее время: " << std::fixed << std::setprecision(2) << avg_time << " мс\n";
         logfile << "==========================================\n";
     }
 
-    // 7. ВЫГРУЖАЕМ БИБЛИОТЕКУ
     FreeLibrary(hLib);
-
-    return system_error ? 1 : 0;
+    return 0;
 }
