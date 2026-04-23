@@ -132,30 +132,7 @@ FileStats process_single_file(const std::string& input_file,
     return stats;
 }
 
-// последовательная обработка
-std::vector<FileStats> run_sequential(const std::vector<std::string>& input_files,
-    const std::string& output_dir,
-    char key,
-    set_key_func set_key,
-    caesar_func caesar,
-    std::mutex& log_mutex) {
-    std::cout << "\n=== ПОСЛЕДОВАТЕЛЬНЫЙ РЕЖИМ ===" << std::endl;
-    std::vector<FileStats> results;
 
-    for (size_t i = 0; i < input_files.size(); i++) {
-        std::cout << "Обработка файла " << (i + 1) << "/" << input_files.size()
-            << ": " << input_files[i] << std::endl;
-
-        FileStats stats = process_single_file(input_files[i], output_dir, key,
-            set_key, caesar, log_mutex);
-        results.push_back(stats);
-
-        std::cout << "  Время: " << stats.duration.count() << " мс"
-            << (stats.success ? " [OK]" : " [FAIL]") << std::endl;
-    }
-
-    return results;
-}
 
 // рабочий поток для параллельного режима
 void worker_thread(ParallelContext& ctx, const std::string& output_dir, char key,
@@ -199,69 +176,7 @@ void worker_thread(ParallelContext& ctx, const std::string& output_dir, char key
     std::cout << "Поток " << thread_num << " завершен" << std::endl;
 }
 
-// параллельная обработка
 
-std::vector<FileStats> run_parallel(const std::vector<std::string>& input_files,
-    const std::string& output_dir,
-    char key,
-    set_key_func set_key,
-    caesar_func caesar,
-    std::mutex& log_mutex) {
-    std::cout << "\n=== ПАРАЛЛЕЛЬНЫЙ РЕЖИМ ===" << std::endl;
-    std::cout << "Количество потоков: " << WORKERS_COUNT << std::endl;
-
-    std::queue<std::string> file_queue;
-    std::mutex queue_mutex;
-    std::vector<FileStats> results;
-    std::mutex results_mutex;
-    bool all_done = false;
-
-    // заполняем очередь
-    for (const auto& file : input_files) {
-        file_queue.push(file);
-    }
-
-    std::vector<std::thread> threads;
-
-    // создаём потоки
-    for (int i = 0; i < WORKERS_COUNT; i++) {
-        threads.emplace_back([&, i]() {
-            std::cout << "Поток " << (i + 1) << " (ID: " << std::this_thread::get_id() << ") запущен" << std::endl;
-
-            while (true) {
-                std::string filename;
-
-                // захватываем файл из очереди
-                {
-                    std::lock_guard<std::mutex> lock(queue_mutex);
-                    if (file_queue.empty()) {
-                        break;
-                    }
-                    filename = file_queue.front();
-                    file_queue.pop();
-                }
-
-                std::cout << "Поток " << (i + 1) << " обрабатывает: " << filename << std::endl;
-                FileStats stats = process_single_file(filename, output_dir, key,
-                    set_key, caesar, log_mutex);
-
-                {
-                    std::lock_guard<std::mutex> lock(results_mutex);
-                    results.push_back(stats);
-                }
-            }
-
-            std::cout << "Поток " << (i + 1) << " завершен" << std::endl;
-        });
-    }
-
-    // ждём завершения всех потоков
-    for (auto& t : threads) {
-        t.join();
-    }
-
-    return results;
-}
 
 // фвтоматический выбор режима
 Mode auto_select_mode(int file_count) {
@@ -286,23 +201,99 @@ Mode parse_mode_arg(int argc, char* argv[]) {
     return MODE_AUTO;
 }
 
-// запуск обработки в заданном режиме и возврат времени
-milliseconds run_mode(Mode mode, const std::vector<std::string>& files,
-    const std::string& output_dir, char key,
-    set_key_func set_key, caesar_func caesar,
+// УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ОБРАБОТКИ ФАЙЛОВ
+// Принимает режим как параметр (может быть MODE_AUTO для автоматического выбора)
+std::vector<FileStats> process_files(const std::vector<std::string>& input_files,
+    const std::string& output_dir,
+    char key,
+    set_key_func set_key,
+    caesar_func caesar,
     std::mutex& log_mutex,
-    std::vector<FileStats>& out_results) {
-    auto start = high_resolution_clock::now();
+    Mode mode,                    // режим передаётся
+    Mode& used_mode,              // какой реально использовался
+    milliseconds& total_duration) {
 
-    if (mode == MODE_SEQUENTIAL) {
-        out_results = run_sequential(files, output_dir, key, set_key, caesar, log_mutex);
+    auto start_time = high_resolution_clock::now();
+    std::vector<FileStats> results;
+
+    // АВТОМАТИЧЕСКИЙ ВЫБОР (если mode == MODE_AUTO)
+    Mode actual_mode = mode;
+    if (mode == MODE_AUTO) {
+        if (input_files.size() < 5) {
+            actual_mode = MODE_SEQUENTIAL;
+            std::cout << "Автовыбор: файлов " << input_files.size() << " < 5 -> ПОСЛЕДОВАТЕЛЬНЫЙ режим" << std::endl;
+        }
+        else {
+            actual_mode = MODE_PARALLEL;
+            std::cout << "Автовыбор: файлов " << input_files.size() << " >= 5 -> ПАРАЛЛЕЛЬНЫЙ режим" << std::endl;
+        }
     }
-    else {
-        out_results = run_parallel(files, output_dir, key, set_key, caesar, log_mutex);
+    used_mode = actual_mode;
+
+    // ЗАПУСК ВЫБРАННОГО РЕЖИМА
+    if (actual_mode == MODE_SEQUENTIAL) {
+        std::cout << "\n=== ПОСЛЕДОВАТЕЛЬНЫЙ РЕЖИМ ===" << std::endl;
+
+        for (size_t i = 0; i < input_files.size(); i++) {
+            std::cout << "Обработка файла " << (i + 1) << "/" << input_files.size()
+                << ": " << input_files[i] << std::endl;
+
+            FileStats stats = process_single_file(input_files[i], output_dir, key,
+                set_key, caesar, log_mutex);
+            results.push_back(stats);
+
+            std::cout << "  Время: " << stats.duration.count() << " мс"
+                << (stats.success ? " [OK]" : " [FAIL]") << std::endl;
+        }
+    }
+    else { // MODE_PARALLEL
+        std::cout << "\n=== ПАРАЛЛЕЛЬНЫЙ РЕЖИМ ===" << std::endl;
+        std::cout << "Количество потоков: " << WORKERS_COUNT << std::endl;
+
+        std::queue<std::string> file_queue;
+        std::mutex queue_mutex;
+        std::mutex results_mutex;
+
+        for (const auto& file : input_files) {
+            file_queue.push(file);
+        }
+
+        std::vector<std::thread> threads;
+
+        for (int i = 0; i < WORKERS_COUNT; i++) {
+            threads.emplace_back([&, i]() {
+                std::cout << "Поток " << (i + 1) << " (ID: " << std::this_thread::get_id() << ") запущен" << std::endl;
+
+                while (true) {
+                    std::string filename;
+                    {
+                        std::lock_guard<std::mutex> lock(queue_mutex);
+                        if (file_queue.empty()) break;
+                        filename = file_queue.front();
+                        file_queue.pop();
+                    }
+
+                    std::cout << "Поток " << (i + 1) << " обрабатывает: " << filename << std::endl;
+                    FileStats stats = process_single_file(filename, output_dir, key,
+                        set_key, caesar, log_mutex);
+                    {
+                        std::lock_guard<std::mutex> lock(results_mutex);
+                        results.push_back(stats);
+                    }
+                }
+                std::cout << "Поток " << (i + 1) << " завершен" << std::endl;
+            });
+        }
+
+        for (auto& t : threads) {
+            t.join();
+        }
     }
 
-    auto end = high_resolution_clock::now();
-    return duration_cast<milliseconds>(end - start);
+    auto end_time = high_resolution_clock::now();
+    total_duration = duration_cast<milliseconds>(end_time - start_time);
+
+    return results;
 }
 
 int main(int argc, char* argv[]) {
@@ -336,11 +327,6 @@ int main(int argc, char* argv[]) {
     }
     char key = argv[argc - 1][0];
 
-    // автовыбор
-    Mode original_mode = mode;
-    if (mode == MODE_AUTO) {
-        mode = auto_select_mode(static_cast<int>(input_files.size()));
-    }
 
     // вывод информации
     std::cout << "=========================================" << std::endl;
@@ -411,9 +397,13 @@ int main(int argc, char* argv[]) {
     }
 
     // запуск выбранного режима
-    std::vector<FileStats> results;
-    milliseconds selected_duration = run_mode(mode, valid_files, output_dir, key,
-        set_key, caesar, log_mutex, results);
+    Mode used_mode;
+    milliseconds total_duration;
+    std::vector<FileStats> results = process_files(valid_files, output_dir, key,
+        set_key, caesar, log_mutex,
+        mode,           // передаём режим из командной строки
+        used_mode,      // какой реально использовался
+        total_duration);
 
     // подсчёт статистики
     int success_count = 0;
@@ -428,47 +418,44 @@ int main(int argc, char* argv[]) {
     std::cout << "\n=========================================" << std::endl;
     std::cout << "ВСЕ ФАЙЛЫ УСПЕШНО ОБРАБОТАНЫ!" << std::endl;
     std::cout << "Скопировано файлов: " << success_count << " из " << valid_files.size() << std::endl;
-    std::cout << "Общее время: " << selected_duration.count() << " мс" << std::endl;
+    std::cout << "Общее время: " << total_duration.count() << " мс" << std::endl;
     std::cout << "Среднее время на файл: " << std::fixed << std::setprecision(2) << avg_time << " мс" << std::endl;
     std::cout << "=========================================" << std::endl;
 
     // СРАВНИТЕЛЬНАЯ ТАБЛИЦА (только в авто-режиме)
-    if (original_mode == MODE_AUTO && valid_files.size() >= 2) {
+    if (mode == MODE_AUTO && valid_files.size() >= 1) {
         std::cout << "\n=== СРАВНИТЕЛЬНАЯ ТАБЛИЦА ===" << std::endl;
 
-        Mode alternative = (mode == MODE_SEQUENTIAL) ? MODE_PARALLEL : MODE_SEQUENTIAL;
+        Mode alternative = (used_mode == MODE_SEQUENTIAL) ? MODE_PARALLEL : MODE_SEQUENTIAL;
         std::cout << "Запуск альтернативного режима ("
             << (alternative == MODE_SEQUENTIAL ? "ПОСЛЕДОВАТЕЛЬНЫЙ" : "ПАРАЛЛЕЛЬНЫЙ")
             << ") для сравнения..." << std::endl;
 
-        // создаём новую директорию для альтернативного режима
         std::string alt_output_dir = output_dir + "_alt";
         fs::create_directories(alt_output_dir);
 
         std::vector<FileStats> alt_results;
-        milliseconds alt_duration = run_mode(alternative, valid_files, alt_output_dir, key,
-            set_key, caesar, log_mutex, alt_results);
+        milliseconds alt_duration;
 
-        // подсчёт статистики альтернативного режима
-        int alt_success = 0;
-        for (const auto& stat : alt_results) {
-            if (stat.success) alt_success++;
-        }
+        // Переиспользуем ТУ ЖЕ функцию process_files для альтернативного режима
+        Mode dummy_mode;
+        alt_results = process_files(valid_files, alt_output_dir, key,
+            set_key, caesar, log_mutex,
+            alternative,     // принудительно альтернативный режим
+            dummy_mode,
+            alt_duration);
 
+        // Вывод сравнения
         std::cout << "\n--- СРАВНЕНИЕ ---" << std::endl;
         std::cout << std::left << std::setw(25) << "Показатель"
-            << std::setw(20) << (mode == MODE_SEQUENTIAL ? "SEQUENTIAL" : "PARALLEL")
+            << std::setw(20) << (used_mode == MODE_SEQUENTIAL ? "SEQUENTIAL" : "PARALLEL")
             << std::setw(20) << (alternative == MODE_SEQUENTIAL ? "SEQUENTIAL" : "PARALLEL") << std::endl;
         std::cout << std::string(60, '-') << std::endl;
         std::cout << std::left << std::setw(25) << "Общее время (мс)"
-            << std::setw(20) << selected_duration.count()
+            << std::setw(20) << total_duration.count()
             << std::setw(20) << alt_duration.count() << std::endl;
-        std::cout << std::left << std::setw(25) << "Обработано файлов"
-            << std::setw(20) << success_count
-            << std::setw(20) << alt_success << std::endl;
 
-        // ускорение
-        double speedup = static_cast<double>(alt_duration.count()) / selected_duration.count();
+        double speedup = static_cast<double>(alt_duration.count()) / total_duration.count();
         std::cout << std::string(60, '-') << std::endl;
         if (speedup > 1.0) {
             std::cout << "Выбранный режим БЫСТРЕЕ в " << std::fixed << std::setprecision(2)
@@ -478,25 +465,9 @@ int main(int argc, char* argv[]) {
             std::cout << "Выбранный режим МЕДЛЕННЕЕ в " << std::fixed << std::setprecision(2)
                 << (1.0 / speedup) << " раз" << std::endl;
         }
-        else {
-            std::cout << "Режимы работают одинаково" << std::endl;
-        }
         std::cout << "=========================================" << std::endl;
 
-        // очистка временной директории
-        //fs::remove_all(alt_output_dir);
-    }
-
-    // итоговая запись в лог
-    {
-        std::lock_guard<std::mutex> lock(log_mutex);
-        std::ofstream logfile("log.txt", std::ios::app);
-        logfile << "\n==========================================\n";
-        logfile << "Завершение: " << get_current_time() << "\n";
-        logfile << "Скопировано файлов: " << success_count << " из " << valid_files.size() << "\n";
-        logfile << "Общее время: " << selected_duration.count() << " мс\n";
-        logfile << "Среднее время: " << std::fixed << std::setprecision(2) << avg_time << " мс\n";
-        logfile << "==========================================\n";
+        fs::remove_all(alt_output_dir);
     }
 
     FreeLibrary(hLib);
